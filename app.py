@@ -193,12 +193,27 @@ def handle_message_text(text, user_id):
     if any(kw in lower for kw in ["ดูการแจ้งเตือน", "การแจ้งเตือน", "myalert", "my alert"]):
         alerts = get_alerts(user_id)
         if not alerts:
-            return "📭 คุณยังไม่มีการแจ้งเตือนที่ตั้งไว้\n\nพิมพ์ เช่น:\nแจ้งเตือน 3400\nต่ำกว่า 3300"
+            return "📭 คุณยังไม่มีการแจ้งเตือนที่ตั้งไว้"
         lines = ["🔔 การแจ้งเตือนของคุณ:", "─" * 20]
         for i, a in enumerate(alerts, 1):
             dir_text = "📈 ขึ้นถึง ≥" if a["direction"] == "above" else "📉 ลงต่ำกว่า ≤"
             lines.append(f"{i}. {dir_text} ${a['target_price']:,.2f}")
+        lines.append("─" * 20)
+        lines.append("💡 พิมพ์ 'ลบ 1' เพื่อลบรายการที่ 1")
         return "\n".join(lines)
+
+    match_delete = re.search(r'^ลบ\s*(\d+)$', lower)
+    if match_delete:
+        index = int(match_delete.group(1))
+        alerts = get_alerts(user_id)
+        if not alerts:
+            return "📭 ไม่มีการแจ้งเตือนที่ตั้งไว้"
+        if index < 1 or index > len(alerts):
+            return f"❌ กรุณาระบุหมายเลข 1-{len(alerts)}"
+        alert = alerts[index - 1]
+        delete_alert_by_id(alert["id"])
+        dir_text = "ขึ้นถึง" if alert["direction"] == "above" else "ลงต่ำกว่า"
+        return f"🗑️ ลบการแจ้งเตือน {dir_text} ${alert['target_price']:,.2f} แล้วครับ"
 
     if any(kw in lower for kw in ["ยกเลิก", "ลบการแจ้งเตือน", "cancel"]):
         if delete_all_alerts(user_id):
@@ -211,14 +226,16 @@ def handle_message_text(text, user_id):
         "─────────────────────\n"
         "💰 ขอราคาทอง\n"
         "   → เพื่อดูราคา XAUUSD ณ ปัจจุบัน\n\n"
-       "📈 แจ้งเตือนสูงกว่า [ราคา]\n"
+        "📈 แจ้งเตือนสูงกว่า [ราคา]\n"
         "   → เตือนเมื่อราคาขึ้นถึงราคาที่กำหนด\n\n"
         "📉 แจ้งเตือนต่ำกว่า [ราคา]\n"
         "   → เตือนเมื่อราคาลงต่ำกว่าที่กำหนด\n\n"
         "📋 ดูการแจ้งเตือน\n"
         "   → แสดง alerts ที่ตั้งไว้\n\n"
         "🗑️ ยกเลิกการแจ้งเตือน\n"
-        "   → ลบ alerts ทั้งหมด"
+        "   → ลบ alerts ทั้งหมด\n\n"
+        "❌ ลบ [หมายเลข]\n"
+        "   → ลบ alert รายการที่ระบุ"
     )
 
 
