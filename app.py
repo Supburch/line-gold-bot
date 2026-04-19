@@ -72,7 +72,7 @@ def format_gold_message(price_usd, thb_rate):
         f"🔸 บาท/บาท   : ฿{price_thb_per_baht_gold:,.0f}\n"
         f"{'─' * 25}\n"
         f"⏰ {time_str}\n"
-        f"📊 ข้อมูล: metals.live"
+        f"📊 ข้อมูล: GoldAPI.io"
     )
 
 
