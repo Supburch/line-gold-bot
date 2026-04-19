@@ -1,6 +1,6 @@
 import os
 import re
-import yfinance as yf
+import requests
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -35,11 +35,12 @@ if SUPABASE_URL and SUPABASE_KEY:
 # ====== ดึงราคาทอง ======
 def get_gold_price():
     try:
-        ticker = yf.Ticker("GC=F")
-        data = ticker.history(period="1d", interval="1m")
-        if data.empty:
-            raise ValueError("No data")
-        return float(data["Close"].iloc[-1])
+        res = requests.get("https://metals.live/api/spot", timeout=10)
+        data = res.json()
+        for item in data:
+            if item.get("gold"):
+                return float(item["gold"])
+        return None
     except Exception as e:
         print(f"Gold price error: {e}")
         return None
@@ -47,11 +48,9 @@ def get_gold_price():
 
 def get_usd_thb_rate():
     try:
-        ticker = yf.Ticker("USDTHB=X")
-        data = ticker.history(period="1d", interval="1m")
-        if data.empty:
-            raise ValueError("No data")
-        return float(data["Close"].iloc[-1])
+        res = requests.get("https://api.frankfurter.app/latest?from=USD&to=THB", timeout=10)
+        data = res.json()
+        return float(data["rates"]["THB"])
     except:
         return 34.5
 
