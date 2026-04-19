@@ -35,12 +35,11 @@ if SUPABASE_URL and SUPABASE_KEY:
 # ====== ดึงราคาทอง ======
 def get_gold_price():
     try:
-        res = requests.get("https://metals.live/api/spot", timeout=10)
+        api_key = os.environ.get("GOLDAPI_KEY", "")
+        headers = {"x-access-token": api_key}
+        res = requests.get("https://www.goldapi.io/api/XAU/USD", headers=headers, timeout=10)
         data = res.json()
-        for item in data:
-            if item.get("gold"):
-                return float(item["gold"])
-        return None
+        return float(data["price"])
     except Exception as e:
         print(f"Gold price error: {e}")
         return None
