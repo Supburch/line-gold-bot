@@ -58,11 +58,14 @@ def format_gold_message(price_usd, thb_rate):
     bangkok_tz = pytz.timezone("Asia/Bangkok")
     now = datetime.now(bangkok_tz)
     time_str = now.strftime("%d/%m/%Y %H:%M น.")
+    price_thb_oz = price_usd * thb_rate
+    price_per_baht_gold = (price_thb_oz / 31.1035) * 15.244
     return (
         f"🥇 ราคาทองคำ XAUUSD\n"
         f"{'─' * 25}\n"
         f"💵 USD/oz  : ${price_usd:,.2f}\n"
         f"💱 USD/THB : {thb_rate:.2f} บาท\n"
+        f"🔸 ทอง 1 บาท : ฿{price_per_baht_gold:,.0f}\n"
         f"{'─' * 25}\n"
         f"⏰ {time_str}\n"
         f"📊 ข้อมูลจาก: GoldAPI.io"
