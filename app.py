@@ -1,5 +1,6 @@
 import os
 import re
+import requests
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -72,7 +73,7 @@ def format_gold_message(price_usd, thb_rate):
         f"🔸 บาท/บาท   : ฿{price_thb_per_baht_gold:,.0f}\n"
         f"{'─' * 25}\n"
         f"⏰ {time_str}\n"
-        f"📊 ข้อมูล: Gold Futures (GC=F)"
+        f"📊 ข้อมูล: metals.live"
     )
 
 
@@ -169,14 +170,12 @@ def check_alerts():
 def handle_message_text(text, user_id):
     lower = text.lower().strip()
 
-    # ดูราคาทอง
     if any(kw in lower for kw in ["ราคาทอง", "ทอง", "gold", "xauusd", "xau", "ราคา"]):
         price = get_gold_price()
         if price is None:
             return "❌ ขออภัย ไม่สามารถดึงข้อมูลได้ กรุณาลองใหม่ครับ"
         return format_gold_message(price, get_usd_thb_rate())
 
-    # ตั้งเตือนเมื่อราคาลดต่ำกว่า: "ต่ำกว่า 3300"
     match_below = re.search(r'(?:ต่ำกว่า|below|ลง)\s*(\d+(?:\.\d+)?)', lower)
     if match_below:
         target = float(match_below.group(1))
@@ -188,7 +187,6 @@ def handle_message_text(text, user_id):
             )
         return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่"
 
-    # ตั้งเตือนเมื่อราคาขึ้นถึง: "แจ้งเตือน 3400"
     match_above = re.search(r'(?:แจ้งเตือน|เตือน|alert|ถึง)\s*(\d+(?:\.\d+)?)', lower)
     if match_above:
         target = float(match_above.group(1))
@@ -200,7 +198,6 @@ def handle_message_text(text, user_id):
             )
         return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่"
 
-    # ดูรายการ alert
     if any(kw in lower for kw in ["ดูการแจ้งเตือน", "การแจ้งเตือน", "myalert", "my alert"]):
         alerts = get_alerts(user_id)
         if not alerts:
@@ -211,13 +208,11 @@ def handle_message_text(text, user_id):
             lines.append(f"{i}. {dir_text} ${a['target_price']:,.2f}")
         return "\n".join(lines)
 
-    # ยกเลิก alert
     if any(kw in lower for kw in ["ยกเลิก", "ลบการแจ้งเตือน", "cancel"]):
         if delete_all_alerts(user_id):
             return "🗑️ ลบการแจ้งเตือนทั้งหมดแล้วครับ"
         return "❌ เกิดข้อผิดพลาด"
 
-    # Help
     return (
         "👋 สวัสดีครับ! ผมคือ GoldBot 🥇\n\n"
         "📌 คำสั่งที่ใช้ได้:\n"
