@@ -4,3 +4,5 @@ yfinance==0.2.40
 requests==2.32.3
 pytz==2024.1
 gunicorn==22.0.0
+apscheduler==3.10.4
+supabase==2.4.0
