@@ -242,7 +242,19 @@ def health():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_id = event.source.user_id
-    reply_text = handle_message_text(event.message.text, user_id)
+    text = event.message.text.strip()
+
+    # เช็คว่าอยู่ในกลุ่มหรือไม่
+    is_group = event.source.type in ["group", "room"]
+
+    # ถ้าอยู่ในกลุ่ม ต้องพิมพ์ "บอตเอ๋ย" นำหน้าเท่านั้น
+    if is_group:
+        if text.startswith("บอตเอ๋ย"):
+            text = text.split(" ", 1)[1] if " " in text else "ราคาทอง"
+        else:
+            return  # เงียบถ้าไม่มี "บอตเอ๋ย" นำหน้า
+
+    reply_text = handle_message_text(text, user_id)
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message_with_http_info(
