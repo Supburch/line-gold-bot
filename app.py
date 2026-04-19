@@ -72,7 +72,7 @@ def format_gold_message(price_usd, thb_rate):
         f"🔸 บาท/บาท   : ฿{price_thb_per_baht_gold:,.0f}\n"
         f"{'─' * 25}\n"
         f"⏰ {time_str}\n"
-        f"📊 ข้อมูล: GoldAPI.io"
+        f"📊 ข้อมูลจาก: GoldAPI.io"
     )
 
 
@@ -172,10 +172,10 @@ def handle_message_text(text, user_id):
     if any(kw in lower for kw in ["ราคาทอง", "ทอง", "gold", "xauusd", "xau", "ราคา"]):
         price = get_gold_price()
         if price is None:
-            return "❌ ขออภัย ไม่สามารถดึงข้อมูลได้ กรุณาลองใหม่ครับ"
+            return "❌ ขออภัย ไม่สามารถดึงข้อมูลได้ อีกสักครู่กรุณาลองใหม่นะ"
         return format_gold_message(price, get_usd_thb_rate())
 
-    match_below = re.search(r'(?:ต่ำกว่า|below|ลง)\s*(\d+(?:\.\d+)?)', lower)
+    match_below = re.search(r'(?:แจ้งเตือนต่ำกว่า|ต่ำกว่า|below|ลง)\s*(\d+(?:\.\d+)?)', lower)
     if match_below:
         target = float(match_below.group(1))
         if add_alert(user_id, target, "below"):
@@ -184,9 +184,9 @@ def handle_message_text(text, user_id):
                 f"📉 จะแจ้งเมื่อราคาลงต่ำกว่า ${target:,.2f}\n"
                 f"🕐 ตรวจสอบราคาทุก 5 นาที"
             )
-        return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่"
+        return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่นะ"
 
-    match_above = re.search(r'(?:แจ้งเตือน|เตือน|alert|ถึง)\s*(\d+(?:\.\d+)?)', lower)
+    match_above = re.search(r'(?:แจ้งเตือนสูงกว่า|แจ้งเตือน|เตือน|alert|ถึง)\s*(\d+(?:\.\d+)?)', lower)
     if match_above:
         target = float(match_above.group(1))
         if add_alert(user_id, target, "above"):
@@ -195,7 +195,7 @@ def handle_message_text(text, user_id):
                 f"📈 จะแจ้งเมื่อราคาขึ้นถึง ${target:,.2f}\n"
                 f"🕐 ตรวจสอบราคาทุก 5 นาที"
             )
-        return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่"
+        return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่นะ"
 
     if any(kw in lower for kw in ["ดูการแจ้งเตือน", "การแจ้งเตือน", "myalert", "my alert"]):
         alerts = get_alerts(user_id)
@@ -213,18 +213,18 @@ def handle_message_text(text, user_id):
         return "❌ เกิดข้อผิดพลาด"
 
     return (
-        "👋 สวัสดีครับ! ผมคือ GoldBot 🥇\n\n"
-        "📌 คำสั่งที่ใช้ได้:\n"
+        "👋 สวัสดี ! ฉันคือ GoldBot 🥇\n\n"
+        "📌 นี่คือคำสั่งที่ใช้กับฉันได้:\n"
         "─────────────────────\n"
-        "💰 ราคาทอง\n"
-        "   → ดูราคา XAUUSD ปัจจุบัน\n\n"
-        "📈 แจ้งเตือน 3400\n"
-        "   → เตือนเมื่อราคาขึ้นถึง $3,400\n\n"
-        "📉 ต่ำกว่า 3300\n"
-        "   → เตือนเมื่อราคาต่ำกว่า $3,300\n\n"
+        "💰 ขอราคาทอง\n"
+        "   → เพื่อดูราคา XAUUSD ณ ปัจจุบัน\n\n"
+       "📈 แจ้งเตือนสูงกว่า [ราคา]\n"
+        "   → เตือนเมื่อราคาขึ้นถึงราคาที่กำหนด\n\n"
+        "📉 แจ้งเตือนต่ำกว่า [ราคา]\n"
+        "   → เตือนเมื่อราคาลงต่ำกว่าที่กำหนด\n\n"
         "📋 ดูการแจ้งเตือน\n"
         "   → แสดง alerts ที่ตั้งไว้\n\n"
-        "🗑️ ยกเลิก\n"
+        "🗑️ ยกเลิกการแจ้งเตือน\n"
         "   → ลบ alerts ทั้งหมด"
     )
 
