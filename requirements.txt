@@ -6,3 +6,5 @@ apscheduler==3.10.4
 supabase==1.2.0
 gspread
 yfinance
+websockets
+lxml
