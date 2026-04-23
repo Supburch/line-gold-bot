@@ -1,12 +1,23 @@
-import yfinance as yf
 import gspread
 import os
 import json
 import time
+import requests
+
+def get_stock_price(symbol):
+    try:
+        # ใช้ดึงราคาจาก Yahoo Finance แบบไม่ผ่าน Library (ป้องกัน Error websockets)
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers)
+        data = response.json()
+        price = data['chart']['result'][0]['meta']['regularMarketPrice']
+        return price
+    except:
+        return "N/A"
 
 def update_stock():
     try:
-        # 1. ดึงกุญแจจาก GitHub Secrets
         creds_json = os.environ.get("GOOGLE_SHEETS_CREDS")
         if not creds_json:
             print("Error: ไม่พบกุญแจใน Secrets")
@@ -15,12 +26,9 @@ def update_stock():
         creds_dict = json.loads(creds_json)
         gc = gspread.service_account_from_dict(creds_dict)
 
-        # 2. เปิดไฟล์ Google Sheets (แก้ชื่อให้ตรงกับไฟล์ของคุณ)
-        # อย่าลืมกด Share ชีตนี้ให้ Email ของบอตด้วยนะ!
         sh = gc.open("stock-updater") 
         worksheet = sh.get_worksheet(0)
 
-        # 3. รายชื่อหุ้นทั้งหมดที่ต้องการ (เติม .BK ให้เรียบร้อย)
         stocks = [
             "THAIBEV19.BK", "DBS19.BK", "UOB19.BK", "SEMB19.BK", "SGX19.BK",
             "FERRARI80.BK", "HERMES80.BK", "LOREAL80.BK", "SANOFI80.BK", "NOVOB80.BK",
@@ -34,31 +42,19 @@ def update_stock():
             "NETEASE80.BK", "VENTURE19.BK", "STEG19.BK"
         ]
         
-        # 4. เตรียมข้อมูลเพื่ออัปเดตแบบทีละเยอะๆ (Batch Update) เพื่อความรวดเร็ว
         values = []
         for symbol in stocks:
-            try:
-                ticker = yf.Ticker(symbol)
-                # ดึงราคาปัจจุบัน
-                price = ticker.fast_info['last_price']
-                values.append([price])
-                print(f"ดึงข้อมูลสำเร็จ: {symbol} = {price}")
-            except Exception as e:
-                values.append(["N/A"])
-                print(f"ไม่พบข้อมูลหุ้น: {symbol} ({e})")
-            
-            # ป้องกันโดนแบนจากการดึงข้อมูลเร็วเกินไป
-            time.sleep(0.2)
+            price = get_stock_price(symbol)
+            values.append([price])
+            print(f"Fetched {symbol}: {price}")
+            time.sleep(0.5)
 
-        # 5. เขียนลงในคอลัมน์ AI (เริ่มตั้งแต่ AI2 เป็นต้นไป)
-        # ใช้ range AI2:AI... ตามจำนวนหุ้น
         range_to_update = f"AI2:AI{1 + len(stocks)}"
         worksheet.update(range_to_update, values)
-
-        print(f"--- อัปเดตราคาหุ้น {len(stocks)} ตัว ลงในคอลัมน์ AI เรียบร้อยแล้ว ---")
+        print("--- Update Completed ---")
 
     except Exception as e:
-        print(f"เกิดข้อผิดพลาดใหญ่: {e}")
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     update_stock()
