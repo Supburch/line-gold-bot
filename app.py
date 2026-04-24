@@ -32,32 +32,25 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# ====== ฟังก์ชันดึงข้อมูล (คืนค่าเป็นตัวเลขเท่านั้น) ======
+# ====== ฟังก์ชันดึงข้อมูล ======
 def get_gold_price():
-    """ดึงราคาทอง Spot (XAUUSD) เป็นตัวเลข float"""
     try:
-        # ใช้ API ที่รองรับการดึงข้อมูล JSON
-        url = "https://api.gold-api.com/api/v1/gold-price"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        
-        # ดึงค่าตัวเลขจาก Key 'price'
-        price = data.get('price')
-        if price:
-            return float(price)
-        return None
+        api_key = os.environ.get("GOLDAPI_KEY", "")
+        headers = {"x-access-token": api_key}
+        res = requests.get("https://www.goldapi.io/api/XAU/USD", headers=headers, timeout=10)
+        data = res.json()
+        return float(data["price"])
     except Exception as e:
         print(f"Gold price error: {e}")
         return None
 
 def get_usd_thb_rate():
-    """ดึงอัตราแลกเปลี่ยน USD/THB"""
     try:
         res = requests.get("https://api.frankfurter.app/latest?from=USD&to=THB", timeout=10)
         data = res.json()
         return float(data["rates"]["THB"])
     except:
-        return 35.0  # ค่าสำรองหาก API ล่ม
+        return 35.0
 
 
 # ====== ฟังก์ชันจัดรูปแบบข้อความ ======
@@ -65,12 +58,8 @@ def format_gold_message(price_usd, thb_rate):
     bangkok_tz = pytz.timezone("Asia/Bangkok")
     now = datetime.now(bangkok_tz)
     time_str = now.strftime("%d/%m/%Y %H:%M น.")
-    
-    # คำนวณราคาทองไทย (สูตรมาตรฐาน)
-    # ทอง 1 บาท = 15.244 กรัม / 1 Troy Oz = 31.1035 กรัม
     price_thb_oz = price_usd * thb_rate
     price_per_baht_gold = (price_thb_oz / 31.1035) * 15.244
-    
     return (
         f"🥇 ราคาทองคำ XAUUSD\n"
         f"{'─' * 25}\n"
@@ -79,11 +68,11 @@ def format_gold_message(price_usd, thb_rate):
         f"🔸 ทอง 1 บาท : ฿{price_per_baht_gold:,.0f}\n"
         f"{'─' * 25}\n"
         f"⏰ {time_str}\n"
-        f"📊 ข้อมูลจาก: GoldAPI"
+        f"📊 ข้อมูลจาก: GoldAPI.io"
     )
 
 
-# ====== จัดการ Alert (Supabase) ======
+# ====== จัดการ Alert ======
 def add_alert(user_id, target_price, direction):
     if not supabase: return False
     try:
@@ -125,7 +114,6 @@ def check_alerts():
     if not supabase: return
     price = get_gold_price()
     if price is None: return
-    
     try:
         res = supabase.table("alerts").select("*").execute()
         alerts = res.data
@@ -137,7 +125,6 @@ def check_alerts():
         if (a["direction"] == "above" and price >= a["target_price"]) or
            (a["direction"] == "below" and price <= a["target_price"])
     ]
-
     if not triggered: return
 
     with ApiClient(configuration) as api_client:
@@ -168,38 +155,50 @@ def check_alerts():
 def handle_message_text(text, user_id):
     lower = text.lower().strip()
 
-    # ดูราคาทอง
     if any(kw in lower for kw in ["ราคาทอง", "ทอง", "gold", "xauusd", "xau", "ราคา"]):
         price_val = get_gold_price()
         if price_val is None:
             return "❌ ขออภัย ไม่สามารถดึงข้อมูลได้ อีกสักครู่กรุณาลองใหม่นะ"
         return format_gold_message(price_val, get_usd_thb_rate())
 
-    # ตั้ง Alert ต่ำกว่า
-    match_below = re.search(r'(?:แจ้งเตือนต่ำกว่า|ต่ำกว่า|below|ลง)\s*(\d+(?:\.\d+)?)', lower)
+    match_below = re.search(r'(?:แจ้งเตือนต่ำกว่า|ต่ำกว่า|below|ลง)\s*(\d+(?:\.\d+)?)\s*(บาท|thb|฿)?', lower)
     if match_below:
         target = float(match_below.group(1))
+        unit = match_below.group(2)
+        if unit in ["บาท", "thb", "฿"]:
+            thb_rate = get_usd_thb_rate()
+            target_usd = (target / 15.244 * 31.1035) / thb_rate
+            display = f"฿{target:,.0f} (≈ ${target_usd:,.2f})"
+            target = round(target_usd, 2)
+        else:
+            display = f"${target:,.2f}"
         if add_alert(user_id, target, "below"):
             return (
                 f"✅ ตั้งการแจ้งเตือนสำเร็จ!\n"
-                f"📉 จะแจ้งเมื่อราคาลงต่ำกว่า ${target:,.2f}\n"
+                f"📉 จะแจ้งเมื่อราคาลงต่ำกว่า {display}\n"
                 f"🕐 ตรวจสอบราคาทุก 5 นาที"
             )
         return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่นะ"
 
-    # ตั้ง Alert สูงกว่า
-    match_above = re.search(r'(?:แจ้งเตือนสูงกว่า|แจ้งเตือน|เตือน|alert|ถึง)\s*(\d+(?:\.\d+)?)', lower)
+    match_above = re.search(r'(?:แจ้งเตือนสูงกว่า|แจ้งเตือน|เตือน|alert|ถึง)\s*(\d+(?:\.\d+)?)\s*(บาท|thb|฿)?', lower)
     if match_above:
         target = float(match_above.group(1))
+        unit = match_above.group(2)
+        if unit in ["บาท", "thb", "฿"]:
+            thb_rate = get_usd_thb_rate()
+            target_usd = (target / 15.244 * 31.1035) / thb_rate
+            display = f"฿{target:,.0f} (≈ ${target_usd:,.2f})"
+            target = round(target_usd, 2)
+        else:
+            display = f"${target:,.2f}"
         if add_alert(user_id, target, "above"):
             return (
                 f"✅ ตั้งการแจ้งเตือนสำเร็จ!\n"
-                f"📈 จะแจ้งเมื่อราคาขึ้นถึง ${target:,.2f}\n"
+                f"📈 จะแจ้งเมื่อราคาขึ้นถึง {display}\n"
                 f"🕐 ตรวจสอบราคาทุก 5 นาที"
             )
         return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่นะ"
 
-    # ดูรายการ Alert
     if any(kw in lower for kw in ["ดูการแจ้งเตือน", "การแจ้งเตือน", "myalert", "my alert"]):
         alerts = get_alerts(user_id)
         if not alerts:
@@ -212,7 +211,6 @@ def handle_message_text(text, user_id):
         lines.append("💡 พิมพ์ 'ลบ 1' เพื่อลบรายการที่ 1")
         return "\n".join(lines)
 
-    # ลบ Alert รายตัว
     match_delete = re.search(r'^ลบ\s*(\d+)$', lower)
     if match_delete:
         index = int(match_delete.group(1))
@@ -226,7 +224,6 @@ def handle_message_text(text, user_id):
         dir_text = "ขึ้นถึง" if alert["direction"] == "above" else "ลงต่ำกว่า"
         return f"🗑️ ลบการแจ้งเตือน {dir_text} ${alert['target_price']:,.2f} แล้ว"
 
-    # ลบ Alert ทั้งหมด
     if any(kw in lower for kw in ["ยกเลิก", "ลบการแจ้งเตือน", "cancel"]):
         if delete_all_alerts(user_id):
             return "🗑️ ลบการแจ้งเตือนทั้งหมดแล้ว"
