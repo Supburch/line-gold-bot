@@ -32,55 +32,45 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# ====== ดึงราคาทอง ======
+# ====== ฟังก์ชันดึงข้อมูล (คืนค่าเป็นตัวเลขเท่านั้น) ======
 def get_gold_price():
+    """ดึงราคาทอง Spot (XAUUSD) เป็นตัวเลข float"""
     try:
-        api_key = os.environ.get("GOLDAPI_KEY", "")
-        if not api_key:
-            print("Gold price error: GOLDAPI_KEY is missing in Environment Variables")
-            return None
-            
-        headers = {"x-access-token": api_key, "Content-Type": "application/json"}
-        # ลองดึงข้อมูลจาก API
-        res = requests.get("https://www.goldapi.io/api/XAU/USD", headers=headers, timeout=10)
+        # ใช้ API ที่รองรับการดึงข้อมูล JSON
+        url = "https://api.gold-api.com/api/v1/gold-price"
+        response = requests.get(url, timeout=10)
+        data = response.json()
         
-        # ตรวจสอบว่า HTTP Status OK หรือไม่ (200)
-        if res.status_code != 200:
-            print(f"Gold price error: HTTP {res.status_code} - {res.text}")
-            return None
-
-        data = res.json()
-        
-        # ตรวจสอบ key 'price' แบบปลอดภัย
+        # ดึงค่าตัวเลขจาก Key 'price'
         price = data.get('price')
-        
-        if price is not None:
+        if price:
             return float(price)
-        else:
-            # ถ้าไม่มี price ให้แสดง Error ใน Log ของ Render เพื่อให้เราไปเช็กต่อได้
-            print(f"Gold price error: Key 'price' not found. API Response: {data}")
-            return None
-            
+        return None
     except Exception as e:
         print(f"Gold price error: {e}")
         return None
 
-
 def get_usd_thb_rate():
+    """ดึงอัตราแลกเปลี่ยน USD/THB"""
     try:
         res = requests.get("https://api.frankfurter.app/latest?from=USD&to=THB", timeout=10)
         data = res.json()
         return float(data["rates"]["THB"])
     except:
-        return 34.5
+        return 35.0  # ค่าสำรองหาก API ล่ม
 
 
+# ====== ฟังก์ชันจัดรูปแบบข้อความ ======
 def format_gold_message(price_usd, thb_rate):
     bangkok_tz = pytz.timezone("Asia/Bangkok")
     now = datetime.now(bangkok_tz)
     time_str = now.strftime("%d/%m/%Y %H:%M น.")
+    
+    # คำนวณราคาทองไทย (สูตรมาตรฐาน)
+    # ทอง 1 บาท = 15.244 กรัม / 1 Troy Oz = 31.1035 กรัม
     price_thb_oz = price_usd * thb_rate
     price_per_baht_gold = (price_thb_oz / 31.1035) * 15.244
+    
     return (
         f"🥇 ราคาทองคำ XAUUSD\n"
         f"{'─' * 25}\n"
@@ -89,14 +79,13 @@ def format_gold_message(price_usd, thb_rate):
         f"🔸 ทอง 1 บาท : ฿{price_per_baht_gold:,.0f}\n"
         f"{'─' * 25}\n"
         f"⏰ {time_str}\n"
-        f"📊 ข้อมูลจาก: GoldAPI.io"
+        f"📊 ข้อมูลจาก: GoldAPI"
     )
 
 
-# ====== จัดการ Alert ======
+# ====== จัดการ Alert (Supabase) ======
 def add_alert(user_id, target_price, direction):
-    if not supabase:
-        return False
+    if not supabase: return False
     try:
         supabase.table("alerts").insert({
             "user_id": user_id,
@@ -108,26 +97,21 @@ def add_alert(user_id, target_price, direction):
         print(f"Add alert error: {e}")
         return False
 
-
 def get_alerts(user_id):
-    if not supabase:
-        return []
+    if not supabase: return []
     try:
         res = supabase.table("alerts").select("*").eq("user_id", user_id).execute()
         return res.data
     except:
         return []
 
-
 def delete_all_alerts(user_id):
-    if not supabase:
-        return False
+    if not supabase: return False
     try:
         supabase.table("alerts").delete().eq("user_id", user_id).execute()
         return True
     except:
         return False
-
 
 def delete_alert_by_id(alert_id):
     try:
@@ -138,11 +122,10 @@ def delete_alert_by_id(alert_id):
 
 # ====== ตรวจ Alert ทุก 5 นาที ======
 def check_alerts():
-    if not supabase:
-        return
+    if not supabase: return
     price = get_gold_price()
-    if price is None:
-        return
+    if price is None: return
+    
     try:
         res = supabase.table("alerts").select("*").execute()
         alerts = res.data
@@ -155,8 +138,7 @@ def check_alerts():
            (a["direction"] == "below" and price <= a["target_price"])
     ]
 
-    if not triggered:
-        return
+    if not triggered: return
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -186,12 +168,14 @@ def check_alerts():
 def handle_message_text(text, user_id):
     lower = text.lower().strip()
 
+    # ดูราคาทอง
     if any(kw in lower for kw in ["ราคาทอง", "ทอง", "gold", "xauusd", "xau", "ราคา"]):
-        price = get_gold_price()
-        if price is None:
+        price_val = get_gold_price()
+        if price_val is None:
             return "❌ ขออภัย ไม่สามารถดึงข้อมูลได้ อีกสักครู่กรุณาลองใหม่นะ"
-        return format_gold_message(price, get_usd_thb_rate())
+        return format_gold_message(price_val, get_usd_thb_rate())
 
+    # ตั้ง Alert ต่ำกว่า
     match_below = re.search(r'(?:แจ้งเตือนต่ำกว่า|ต่ำกว่า|below|ลง)\s*(\d+(?:\.\d+)?)', lower)
     if match_below:
         target = float(match_below.group(1))
@@ -203,6 +187,7 @@ def handle_message_text(text, user_id):
             )
         return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่นะ"
 
+    # ตั้ง Alert สูงกว่า
     match_above = re.search(r'(?:แจ้งเตือนสูงกว่า|แจ้งเตือน|เตือน|alert|ถึง)\s*(\d+(?:\.\d+)?)', lower)
     if match_above:
         target = float(match_above.group(1))
@@ -214,6 +199,7 @@ def handle_message_text(text, user_id):
             )
         return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่นะ"
 
+    # ดูรายการ Alert
     if any(kw in lower for kw in ["ดูการแจ้งเตือน", "การแจ้งเตือน", "myalert", "my alert"]):
         alerts = get_alerts(user_id)
         if not alerts:
@@ -226,6 +212,7 @@ def handle_message_text(text, user_id):
         lines.append("💡 พิมพ์ 'ลบ 1' เพื่อลบรายการที่ 1")
         return "\n".join(lines)
 
+    # ลบ Alert รายตัว
     match_delete = re.search(r'^ลบ\s*(\d+)$', lower)
     if match_delete:
         index = int(match_delete.group(1))
@@ -237,29 +224,23 @@ def handle_message_text(text, user_id):
         alert = alerts[index - 1]
         delete_alert_by_id(alert["id"])
         dir_text = "ขึ้นถึง" if alert["direction"] == "above" else "ลงต่ำกว่า"
-        return f"🗑️ ลบการแจ้งเตือน {dir_text} ${alert['target_price']:,.2f} แล้วครับ"
+        return f"🗑️ ลบการแจ้งเตือน {dir_text} ${alert['target_price']:,.2f} แล้ว"
 
+    # ลบ Alert ทั้งหมด
     if any(kw in lower for kw in ["ยกเลิก", "ลบการแจ้งเตือน", "cancel"]):
         if delete_all_alerts(user_id):
-            return "🗑️ ลบการแจ้งเตือนทั้งหมดแล้วครับ"
+            return "🗑️ ลบการแจ้งเตือนทั้งหมดแล้ว"
         return "❌ เกิดข้อผิดพลาด"
 
     return (
-        "👋 สวัสดี ! ฉันคือ GoldBot 🥇\n\n"
-        "📌 นี่คือคำสั่งที่ใช้กับฉันได้:\n"
+        "👋 สวัสดี! ฉันคือ GoldBot 🥇\n\n"
+        "📌 คำสั่งที่ใช้งานได้:\n"
         "─────────────────────\n"
         "💰 ขอราคาทอง\n"
-        "   → เพื่อดูราคา XAUUSD ณ ปัจจุบัน\n\n"
         "📈 แจ้งเตือนสูงกว่า [ราคา]\n"
-        "   → เตือนเมื่อราคาขึ้นถึงราคาที่กำหนด\n\n"
         "📉 แจ้งเตือนต่ำกว่า [ราคา]\n"
-        "   → เตือนเมื่อราคาลงต่ำกว่าที่กำหนด\n\n"
         "📋 ดูการแจ้งเตือน\n"
-        "   → แสดง alerts ที่ตั้งไว้\n\n"
-        "🗑️ ยกเลิกการแจ้งเตือน\n"
-        "   → ลบ alerts ทั้งหมด\n\n"
-        "❌ ลบ [หมายเลข]\n"
-        "   → ลบ alert รายการที่ระบุ"
+        "🗑️ ยกเลิกการแจ้งเตือน"
     )
 
 
@@ -284,24 +265,21 @@ def health():
 def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
-
-    # เช็คว่าอยู่ในกลุ่มหรือไม่
     is_group = event.source.type in ["group", "room"]
 
-    # ถ้าอยู่ในกลุ่ม ต้องพิมพ์ "บอตเอ๋ย" นำหน้าเท่านั้น
     if is_group:
         if text.startswith("บอตเอ๋ย"):
             text = text.split(" ", 1)[1] if " " in text else "ราคาทอง"
         else:
-            return  # เงียบถ้าไม่มี "บอตเอ๋ย" นำหน้า
+            return
 
     reply_text = handle_message_text(text, user_id)
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message_with_http_info(
+        line_bot_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)],
+                messages=[TextMessage(text=reply_text)]
             )
         )
 
