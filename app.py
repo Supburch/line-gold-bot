@@ -36,10 +36,22 @@ if SUPABASE_URL and SUPABASE_KEY:
 def get_gold_price():
     try:
         api_key = os.environ.get("GOLDAPI_KEY", "")
-        headers = {"x-access-token": api_key}
+        if not api_key:
+            print("Gold price error: GOLDAPI_KEY is missing in Environment Variables")
+            return None
+            
+        headers = {"x-access-token": api_key, "Content-Type": "application/json"}
         res = requests.get("https://www.goldapi.io/api/XAU/USD", headers=headers, timeout=10)
         data = res.json()
-        return float(data["price"])
+        
+        # เพิ่มการตรวจสอบว่าในข้อมูลมี 'price' อยู่จริงไหม
+        if "price" in data:
+            return float(data["price"])
+        else:
+            # ถ้าไม่มี price ให้พิมพ์บอกใน Log ว่า API ส่งอะไรกลับมากันแน่
+            print(f"Gold price error: Key 'price' not found. API Response: {data}")
+            return None
+            
     except Exception as e:
         print(f"Gold price error: {e}")
         return None
