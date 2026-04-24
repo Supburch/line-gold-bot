@@ -41,14 +41,23 @@ def get_gold_price():
             return None
             
         headers = {"x-access-token": api_key, "Content-Type": "application/json"}
+        # ลองดึงข้อมูลจาก API
         res = requests.get("https://www.goldapi.io/api/XAU/USD", headers=headers, timeout=10)
+        
+        # ตรวจสอบว่า HTTP Status OK หรือไม่ (200)
+        if res.status_code != 200:
+            print(f"Gold price error: HTTP {res.status_code} - {res.text}")
+            return None
+
         data = res.json()
         
-        # เพิ่มการตรวจสอบว่าในข้อมูลมี 'price' อยู่จริงไหม
-        if "price" in data:
-            return float(data["price"])
+        # ตรวจสอบ key 'price' แบบปลอดภัย
+        price = data.get('price')
+        
+        if price is not None:
+            return float(price)
         else:
-            # ถ้าไม่มี price ให้พิมพ์บอกใน Log ว่า API ส่งอะไรกลับมากันแน่
+            # ถ้าไม่มี price ให้แสดง Error ใน Log ของ Render เพื่อให้เราไปเช็กต่อได้
             print(f"Gold price error: Key 'price' not found. API Response: {data}")
             return None
             
