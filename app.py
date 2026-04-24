@@ -35,13 +35,15 @@ if SUPABASE_URL and SUPABASE_KEY:
 # ====== ฟังก์ชันดึงข้อมูล ======
 def get_gold_price():
     try:
+        # ใช้ Open Gold API ฟรี ไม่ต้อง key
         res = requests.get(
             "https://api.metals.dev/v1/latest?api_key=demo&base=USD&currencies=XAU",
             timeout=10
         )
         data = res.json()
-        rate = data["rates"]["XAU"]
-        return round(1 / rate, 2)
+        xau_rate = data["rates"]["XAU"]
+        # XAU rate คือ 1 USD = กี่ออนซ์ ต้องกลับค่า
+        return round(1 / xau_rate, 2)
     except Exception as e:
         print(f"Gold price error: {e}")
         return None
