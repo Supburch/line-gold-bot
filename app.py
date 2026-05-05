@@ -1,251 +1,170 @@
-import os
-import re
-import requests
+import os, re, time, pytz, logging, requests
+from threading import Lock, Event
+from collections import OrderedDict
+from urllib.parse import urlparse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from datetime import datetime
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, PushMessageRequest, TextMessage,
+    Configuration, ApiClient, MessagingApi, 
+    ReplyMessageRequest, PushMessageRequest, TextMessage
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
-from datetime import datetime
-import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from supabase import create_client
 
+# 1. Logging Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- [ส่วนที่ 1: HttpClient Class] ---
+class HttpClient:
+    def __init__(self):
+        self.session = requests.Session()
+        retry = Retry(
+            total=3, connect=3, read=3, backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+            raise_on_status=False,
+            respect_retry_after_header=True
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+        self.cache = OrderedDict()
+        self.inflight = {} 
+        self.lock = Lock()
+        self.throttle_lock = Lock()
+        self.stats_lock = Lock()
+        
+        self.max_cache_size = 100
+        self.default_timeout = (3, 7)
+        self.stats = {"hit": 0, "miss": 0, "error": 0}
+        self._last_calls = {}
+
+    def throttle(self, url, min_interval=1.0):
+        host = urlparse(url).netloc or "default"
+        with self.throttle_lock:
+            now = time.monotonic()
+            last_call = self._last_calls.get(host, now - min_interval)
+            target_time = max(now, last_call + min_interval)
+            sleep_time = target_time - now
+            self._last_calls[host] = target_time
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+    def fetch_json(self, url, ttl=60, cache_key=None):
+        key = cache_key or url
+        now = time.monotonic()
+        is_owner = False
+
+        with self.lock:
+            if key in self.cache:
+                data, expire = self.cache[key]
+                if now < expire:
+                    self.cache.move_to_end(key)
+                    with self.stats_lock: self.stats["hit"] += 1
+                    return data
+            
+            if key in self.inflight:
+                event = self.inflight[key]
+            else:
+                event = Event()
+                self.inflight[key] = event
+                event.clear()
+                is_owner = True
+
+        if not is_owner:
+            event.wait(timeout=5)
+            return self.fetch_json(url, ttl, cache_key)
+
+        with self.stats_lock: self.stats["miss"] += 1
+        self.throttle(url, 1.0)
+        
+        try:
+            res = self.session.get(url, timeout=self.default_timeout)
+            res.raise_for_status()
+            data = res.json()
+            with self.lock:
+                self.cache[key] = (data, time.monotonic() + ttl)
+                self.cache.move_to_end(key)
+                if len(self.cache) > self.max_cache_size:
+                    self.cache.popitem(last=False)
+            return data
+        except Exception as e:
+            with self.stats_lock: self.stats["error"] += 1
+            logger.error(f"Fetch failed {url}: {e}")
+            with self.lock:
+                if key in self.cache:
+                    data, expire = self.cache[key]
+                    if time.monotonic() - expire < 300:
+                        return data
+            return None
+        finally:
+            with self.lock:
+                if is_owner and key in self.inflight:
+                    self.inflight[key].set()
+                    del self.inflight[key]
+
+    def cleanup(self):
+        now = time.monotonic()
+        with self.lock:
+            expired = [k for k, (_, exp) in self.cache.items() if exp < now]
+            for k in expired: del self.cache[k]
+
+http = HttpClient()
+
+# --- [ส่วนที่ 2: Config & Gold Logic] ---
 app = Flask(__name__)
 
-# ====== LINE Config ======
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# ====== Supabase Config ======
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
+configuration = Configuration(access_token=LINE_TOKEN)
+handler = WebhookHandler(LINE_SECRET)
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-# ====== ฟังก์ชันดึงข้อมูล ======
-def get_gold_price():
     try:
-        # ใช้ Open Gold API ฟรี ไม่ต้อง key
-        res = requests.get(
-            "https://api.metals.dev/v1/latest?api_key=demo&base=USD&currencies=XAU",
-            timeout=10
-        )
-        data = res.json()
-        xau_rate = data["rates"]["XAU"]
-        # XAU rate คือ 1 USD = กี่ออนซ์ ต้องกลับค่า
-        return round(1 / xau_rate, 2)
-    except Exception as e:
-        print(f"Gold price error: {e}")
-        return None
-
-def get_usd_thb_rate():
-    try:
-        res = requests.get("https://api.frankfurter.app/latest?from=USD&to=THB", timeout=10)
-        data = res.json()
-        return float(data["rates"]["THB"])
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     except:
-        return 35.0
+        logger.error("Supabase init failed")
 
+def get_gold_price_thb():
+    gold = http.fetch_json("https://api.frankfurter.app/latest?from=XAU&to=USD", ttl=60)
+    usd_thb = http.fetch_json("https://api.frankfurter.app/latest?from=USD&to=THB", ttl=300)
+    if not gold or not usd_thb: return None
+    spot = gold["rates"]["USD"]
+    rate = usd_thb["rates"]["THB"]
+    thb_baht = (spot * rate / 31.1035) * 15.244 * 0.965
+    return {"spot": spot, "rate": rate, "baht": thb_baht}
 
-# ====== ฟังก์ชันจัดรูปแบบข้อความ ======
-def format_gold_message(price_usd, thb_rate):
-    bangkok_tz = pytz.timezone("Asia/Bangkok")
-    now = datetime.now(bangkok_tz)
-    time_str = now.strftime("%d/%m/%Y %H:%M น.")
-    price_thb_oz = price_usd * thb_rate
-    price_per_baht_gold = (price_thb_oz / 31.1035) * 15.244
-    return (
-        f"🥇 ราคาทองคำ XAUUSD\n"
-        f"{'─' * 25}\n"
-        f"💵 USD/oz  : ${price_usd:,.2f}\n"
-        f"💱 USD/THB : {thb_rate:.2f} บาท\n"
-        f"🔸 ทอง 1 บาท : ฿{price_per_baht_gold:,.0f}\n"
-        f"{'─' * 25}\n"
-        f"⏰ {time_str}\n"
-        f"📊 ข้อมูลจาก: GoldAPI.io"
-    )
+def process_message(text, user_id):
+    raw_text = text.lower().strip()
+    alert_pattern = r'^(?:เตือน|alert|สูงกว่า|ต่ำกว่า)\s*(\d+(?:\.\d+)?)'
+    alert_match = re.search(alert_pattern, raw_text)
+    
+    if alert_match:
+        target = float(alert_match.group(1))
+        direction = "below" if any(x in raw_text for x in ["ต่ำ", "below", "ลง"]) else "above"
+        if supabase:
+            supabase.table("alerts").insert({"user_id": user_id, "target_price": target, "direction": direction}).execute()
+            return f"✅ บันทึกสำเร็จ: จะเตือนเมื่อราคา {'ต่ำกว่า' if direction=='below' else 'ถึง'} ${target:,.2f}"
+        return "⚠️ ระบบฐานข้อมูลไม่พร้อม"
 
+    if any(k in raw_text for k in ["ทอง", "ราคา", "gold"]):
+        data = get_gold_price_thb()
+        if not data: return "❌ ระบบดึงข้อมูลขัดข้อง"
+        now = datetime.now(pytz.timezone("Asia/Bangkok")).strftime("%H:%M")
+        return (f"🥇 ราคาทองคำ XAUUSD\nSpot: ${data['spot']:,.2f}\nTHB: {data['rate']:.2f}\nทองแท่ง: ฿{data['baht']:,.0f}\n⏰ {now}")
 
-# ====== จัดการ Alert ======
-def add_alert(user_id, target_price, direction):
-    if not supabase: return False
-    try:
-        supabase.table("alerts").insert({
-            "user_id": user_id,
-            "target_price": target_price,
-            "direction": direction
-        }).execute()
-        return True
-    except Exception as e:
-        print(f"Add alert error: {e}")
-        return False
+    return "พิมพ์ 'ทอง' หรือ 'เตือน 2600'"
 
-def get_alerts(user_id):
-    if not supabase: return []
-    try:
-        res = supabase.table("alerts").select("*").eq("user_id", user_id).execute()
-        return res.data
-    except:
-        return []
-
-def delete_all_alerts(user_id):
-    if not supabase: return False
-    try:
-        supabase.table("alerts").delete().eq("user_id", user_id).execute()
-        return True
-    except:
-        return False
-
-def delete_alert_by_id(alert_id):
-    try:
-        supabase.table("alerts").delete().eq("id", alert_id).execute()
-    except:
-        pass
-
-
-# ====== ตรวจ Alert ทุก 5 นาที ======
-def check_alerts():
-    if not supabase: return
-    price = get_gold_price()
-    if price is None: return
-    try:
-        res = supabase.table("alerts").select("*").execute()
-        alerts = res.data
-    except:
-        return
-
-    triggered = [
-        a for a in alerts
-        if (a["direction"] == "above" and price >= a["target_price"]) or
-           (a["direction"] == "below" and price <= a["target_price"])
-    ]
-    if not triggered: return
-
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        for alert in triggered:
-            dir_text = "ขึ้นถึง" if alert["direction"] == "above" else "ลงต่ำกว่า"
-            msg = (
-                f"🔔 แจ้งเตือนราคาทอง!\n"
-                f"{'─' * 25}\n"
-                f"ราคา XAUUSD {dir_text} ${alert['target_price']:,.2f} แล้ว!\n"
-                f"💵 ราคาปัจจุบัน: ${price:,.2f}\n"
-                f"{'─' * 25}\n"
-                f"⚠️ การแจ้งเตือนนี้ถูกลบออกแล้ว"
-            )
-            try:
-                line_bot_api.push_message(
-                    PushMessageRequest(
-                        to=alert["user_id"],
-                        messages=[TextMessage(text=msg)]
-                    )
-                )
-                delete_alert_by_id(alert["id"])
-            except Exception as e:
-                print(f"Push error: {e}")
-
-
-# ====== ประมวลผลข้อความ ======
-def handle_message_text(text, user_id):
-    lower = text.lower().strip()
-
-    if any(kw in lower for kw in ["ราคาทอง", "ทอง", "gold", "xauusd", "xau", "ราคา"]):
-        price_val = get_gold_price()
-        if price_val is None:
-            return "❌ ขออภัย ไม่สามารถดึงข้อมูลได้ อีกสักครู่กรุณาลองใหม่นะ"
-        return format_gold_message(price_val, get_usd_thb_rate())
-
-    match_below = re.search(r'(?:แจ้งเตือนต่ำกว่า|ต่ำกว่า|below|ลง)\s*(\d+(?:\.\d+)?)\s*(บาท|thb|฿)?', lower)
-    if match_below:
-        target = float(match_below.group(1))
-        unit = match_below.group(2)
-        if unit in ["บาท", "thb", "฿"]:
-            thb_rate = get_usd_thb_rate()
-            target_usd = (target / 15.244 * 31.1035) / thb_rate
-            display = f"฿{target:,.0f} (≈ ${target_usd:,.2f})"
-            target = round(target_usd, 2)
-        else:
-            display = f"${target:,.2f}"
-        if add_alert(user_id, target, "below"):
-            return (
-                f"✅ ตั้งการแจ้งเตือนสำเร็จ!\n"
-                f"📉 จะแจ้งเมื่อราคาลงต่ำกว่า {display}\n"
-                f"🕐 ตรวจสอบราคาทุก 5 นาที"
-            )
-        return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่นะ"
-
-    match_above = re.search(r'(?:แจ้งเตือนสูงกว่า|แจ้งเตือน|เตือน|alert|ถึง)\s*(\d+(?:\.\d+)?)\s*(บาท|thb|฿)?', lower)
-    if match_above:
-        target = float(match_above.group(1))
-        unit = match_above.group(2)
-        if unit in ["บาท", "thb", "฿"]:
-            thb_rate = get_usd_thb_rate()
-            target_usd = (target / 15.244 * 31.1035) / thb_rate
-            display = f"฿{target:,.0f} (≈ ${target_usd:,.2f})"
-            target = round(target_usd, 2)
-        else:
-            display = f"${target:,.2f}"
-        if add_alert(user_id, target, "above"):
-            return (
-                f"✅ ตั้งการแจ้งเตือนสำเร็จ!\n"
-                f"📈 จะแจ้งเมื่อราคาขึ้นถึง {display}\n"
-                f"🕐 ตรวจสอบราคาทุก 5 นาที"
-            )
-        return "❌ เกิดข้อผิดพลาด กรุณาลองใหม่นะ"
-
-    if any(kw in lower for kw in ["ดูการแจ้งเตือน", "การแจ้งเตือน", "myalert", "my alert"]):
-        alerts = get_alerts(user_id)
-        if not alerts:
-            return "📭 คุณยังไม่มีการแจ้งเตือนที่ตั้งไว้"
-        lines = ["🔔 การแจ้งเตือนของคุณ:", "─" * 20]
-        for i, a in enumerate(alerts, 1):
-            dir_text = "📈 ขึ้นถึง ≥" if a["direction"] == "above" else "📉 ลงต่ำกว่า ≤"
-            lines.append(f"{i}. {dir_text} ${a['target_price']:,.2f}")
-        lines.append("─" * 20)
-        lines.append("💡 พิมพ์ 'ลบ 1' เพื่อลบรายการที่ 1")
-        return "\n".join(lines)
-
-    match_delete = re.search(r'^ลบ\s*(\d+)$', lower)
-    if match_delete:
-        index = int(match_delete.group(1))
-        alerts = get_alerts(user_id)
-        if not alerts:
-            return "📭 ไม่มีการแจ้งเตือนที่ตั้งไว้"
-        if index < 1 or index > len(alerts):
-            return f"❌ กรุณาระบุหมายเลข 1-{len(alerts)}"
-        alert = alerts[index - 1]
-        delete_alert_by_id(alert["id"])
-        dir_text = "ขึ้นถึง" if alert["direction"] == "above" else "ลงต่ำกว่า"
-        return f"🗑️ ลบการแจ้งเตือน {dir_text} ${alert['target_price']:,.2f} แล้ว"
-
-    if any(kw in lower for kw in ["ยกเลิก", "ลบการแจ้งเตือน", "cancel"]):
-        if delete_all_alerts(user_id):
-            return "🗑️ ลบการแจ้งเตือนทั้งหมดแล้ว"
-        return "❌ เกิดข้อผิดพลาด"
-
-    return (
-        "👋 สวัสดี! ฉันคือ GoldBot 🥇\n\n"
-        "📌 คำสั่งที่ใช้งานได้:\n"
-        "─────────────────────\n"
-        "💰 ขอราคาทอง\n"
-        "📈 แจ้งเตือนสูงกว่า [ราคา]\n"
-        "📉 แจ้งเตือนต่ำกว่า [ราคา]\n"
-        "📋 ดูการแจ้งเตือน\n"
-        "🗑️ ยกเลิกการแจ้งเตือน"
-    )
-
-
-# ====== LINE Webhook ======
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
@@ -256,40 +175,47 @@ def callback():
         abort(400)
     return "OK"
 
-
-@app.route("/", methods=["GET"])
-def health():
-    return "GoldBot is running! 🥇"
-
-
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
-    user_id = event.source.user_id
-    text = event.message.text.strip()
-    is_group = event.source.type in ["group", "room"]
-
-    if is_group:
-        if text.startswith("บอตเอ๋ย"):
-            text = text.split(" ", 1)[1] if " " in text else "ราคาทอง"
-        else:
-            return
-
-    reply_text = handle_message_text(text, user_id)
+    reply = process_message(event.message.text, event.source.user_id)
     with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)]
-            )
-        )
+        MessagingApi(api_client).reply_message(ReplyMessageRequest(
+            reply_token=event.reply_token,
+            messages=[TextMessage(text=reply)]
+        ))
 
-
-# ====== Background Scheduler ======
-scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
-scheduler.add_job(check_alerts, "interval", minutes=5)
-scheduler.start()
+# --- [ส่วนที่ 3: Scheduler & Runner] ---
+def check_alerts():
+    if not supabase: return
+    data = get_gold_price_thb()
+    if not data: return
+    current_spot = data['spot']
+    try:
+        res = supabase.table("alerts").select("*").execute()
+        for alert in res.data:
+            triggered = False
+            if alert['direction'] == 'above' and current_spot >= alert['target_price']: triggered = True
+            elif alert['direction'] == 'below' and current_spot <= alert['target_price']: triggered = True
+            
+            if triggered:
+                msg = f"🔔 แจ้งเตือน! ราคาทองถึงเป้าหมาย: ${current_spot:,.2f}"
+                with ApiClient(configuration) as api_client:
+                    MessagingApi(api_client).push_message(PushMessageRequest(to=alert['user_id'], messages=[TextMessage(text=msg)]))
+                supabase.table("alerts").delete().eq("id", alert['id']).execute()
+    except Exception as e:
+        logger.error(f"Alert Job Error: {e}")
 
 if __name__ == "__main__":
+    scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
+    scheduler.add_job(check_alerts, 'interval', minutes=5)
+    scheduler.add_job(http.cleanup, 'interval', minutes=10)
+    
+    run_sched = os.environ.get("RUN_SCHEDULER") == "true"
+    if os.environ.get("RENDER") != "true" or run_sched:
+        scheduler.start()
+        self_url = os.environ.get("SELF_URL")
+        if self_url:
+            scheduler.add_job(lambda: requests.get(self_url), 'interval', minutes=14)
+
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)
