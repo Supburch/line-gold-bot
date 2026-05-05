@@ -16,22 +16,26 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from apscheduler.schedulers.background import BackgroundScheduler
 from supabase import create_client
 
-# 1. Logging Setup
-logging.basicConfig(level=logging.INFO)
+# --- [ 1. Logging Configuration ] ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
-# --- [ส่วนที่ 1: HttpClient Class] ---
+# --- [ 2. Advanced HttpClient with In-flight Protection ] ---
 class HttpClient:
     def __init__(self):
         self.session = requests.Session()
-        retry = Retry(
-            total=3, connect=3, read=3, backoff_factor=0.5,
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET"],
-            raise_on_status=False,
-            respect_retry_after_header=True
+            raise_on_status=False
         )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=50)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
@@ -42,7 +46,7 @@ class HttpClient:
         self.stats_lock = Lock()
         
         self.max_cache_size = 100
-        self.default_timeout = (3, 7)
+        self.default_timeout = (3.05, 7) # (connect, read)
         self.stats = {"hit": 0, "miss": 0, "error": 0}
         self._last_calls = {}
 
@@ -59,68 +63,89 @@ class HttpClient:
 
     def fetch_json(self, url, ttl=60, cache_key=None):
         key = cache_key or url
-        now = time.monotonic()
-        is_owner = False
+        start_wait = time.monotonic()
 
-        with self.lock:
-            if key in self.cache:
-                data, expire = self.cache[key]
-                if now < expire:
-                    self.cache.move_to_end(key)
-                    with self.stats_lock: self.stats["hit"] += 1
-                    return data
-            
-            if key in self.inflight:
-                event = self.inflight[key]
-            else:
-                event = Event()
-                self.inflight[key] = event
-                event.clear()
-                is_owner = True
+        while True:
+            now = time.monotonic()
+            is_owner = False
 
-        if not is_owner:
-            event.wait(timeout=5)
-            return self.fetch_json(url, ttl, cache_key)
+            # Hard timeout เพื่อป้องกัน Infinite loop กรณีเกิดเหตุไม่คาดฝัน
+            if now - start_wait > 15:
+                logger.error(f"Hard timeout for key: {key}")
+                return None
 
-        with self.stats_lock: self.stats["miss"] += 1
-        self.throttle(url, 1.0)
-        
-        try:
-            res = self.session.get(url, timeout=self.default_timeout)
-            res.raise_for_status()
-            data = res.json()
             with self.lock:
-                self.cache[key] = (data, time.monotonic() + ttl)
-                self.cache.move_to_end(key)
-                if len(self.cache) > self.max_cache_size:
-                    self.cache.popitem(last=False)
-            return data
-        except Exception as e:
-            with self.stats_lock: self.stats["error"] += 1
-            logger.error(f"Fetch failed {url}: {e}")
-            with self.lock:
+                # 1. เช็ก Cache (True LRU)
                 if key in self.cache:
                     data, expire = self.cache[key]
-                    if time.monotonic() - expire < 300:
+                    if now < expire:
+                        self.cache.move_to_end(key)
+                        with self.stats_lock: self.stats["hit"] += 1
                         return data
-            return None
-        finally:
-            with self.lock:
-                if is_owner and key in self.inflight:
-                    self.inflight[key].set()
-                    del self.inflight[key]
+
+                # 2. จัดการ In-flight (ถ้ามีคนกำลังดึงอยู่ ให้รอสัญญาณ Event)
+                if key in self.inflight:
+                    event = self.inflight[key]
+                else:
+                    event = Event()
+                    self.inflight[key] = event
+                    event.clear()
+                    is_owner = True
+
+            if not is_owner:
+                # Thread อื่นๆ มารอตรงนี้ (บวกเวลาเผื่อจาก Read timeout)
+                waited = event.wait(timeout=self.default_timeout[1] + 2)
+                if not waited:
+                    logger.warning(f"In-flight timeout for key: {key}")
+                continue # วนกลับไปเช็ก Cache ใหม่หลังจากโดนปลุก
+
+            # 3. ส่วนของ Thread เจ้าของ (ดึงข้อมูลจริง)
+            with self.stats_lock: self.stats["miss"] += 1
+            self.throttle(url, 1.0)
+            
+            try:
+                res = self.session.get(url, timeout=self.default_timeout)
+                res.raise_for_status()
+                data = res.json()
+                
+                with self.lock:
+                    self.cache[key] = (data, time.monotonic() + ttl)
+                    self.cache.move_to_end(key)
+                    if len(self.cache) > self.max_cache_size:
+                        self.cache.popitem(last=False)
+                return data
+
+            except Exception as e:
+                with self.stats_lock: self.stats["error"] += 1
+                logger.error(f"Fetch failed {url}: {e}")
+                # Stale Fallback: ถ้า API ล่ม ให้ใช้ข้อมูลเก่าใน Cache ได้ (ไม่เกิน 5 นาที)
+                with self.lock:
+                    if key in self.cache:
+                        data, expire = self.cache[key]
+                        if time.monotonic() - expire < 300:
+                            self.cache.move_to_end(key)
+                            return data
+                return None
+
+            finally:
+                with self.lock:
+                    if key in self.inflight:
+                        self.inflight[key].set() # ส่งสัญญาณปลุกทุก Thread ที่รออยู่
+                        del self.inflight[key]
 
     def cleanup(self):
         now = time.monotonic()
         with self.lock:
             expired = [k for k, (_, exp) in self.cache.items() if exp < now]
             for k in expired: del self.cache[k]
+        logger.info(f"Cleanup done. Stats: {self.stats}")
 
 http = HttpClient()
 
-# --- [ส่วนที่ 2: Config & Gold Logic] ---
+# --- [ 3. Config & External Services ] ---
 app = Flask(__name__)
 
+# ดึงค่าจาก Environment Variables
 LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -129,23 +154,33 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 configuration = Configuration(access_token=LINE_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 supabase = None
+
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    except:
-        logger.error("Supabase init failed")
+    except Exception as e:
+        logger.error(f"Supabase init failed: {e}")
 
+# --- [ 4. Business Logic ] ---
 def get_gold_price_thb():
+    # Spot Gold (XAU/USD) และ USD/THB Rate
     gold = http.fetch_json("https://api.frankfurter.app/latest?from=XAU&to=USD", ttl=60)
     usd_thb = http.fetch_json("https://api.frankfurter.app/latest?from=USD&to=THB", ttl=300)
-    if not gold or not usd_thb: return None
+
+    if not gold or not usd_thb:
+        return None
+
     spot = gold["rates"]["USD"]
     rate = usd_thb["rates"]["THB"]
+    
+    # สูตรคำนวณทองไทย (96.5%): (Spot * Rate / 31.1035) * 15.244 * 0.965
     thb_baht = (spot * rate / 31.1035) * 15.244 * 0.965
     return {"spot": spot, "rate": rate, "baht": thb_baht}
 
 def process_message(text, user_id):
     raw_text = text.lower().strip()
+    
+    # คำสั่ง Alert
     alert_pattern = r'^(?:เตือน|alert|สูงกว่า|ต่ำกว่า)\s*(\d+(?:\.\d+)?)'
     alert_match = re.search(alert_pattern, raw_text)
     
@@ -153,18 +188,33 @@ def process_message(text, user_id):
         target = float(alert_match.group(1))
         direction = "below" if any(x in raw_text for x in ["ต่ำ", "below", "ลง"]) else "above"
         if supabase:
-            supabase.table("alerts").insert({"user_id": user_id, "target_price": target, "direction": direction}).execute()
-            return f"✅ บันทึกสำเร็จ: จะเตือนเมื่อราคา {'ต่ำกว่า' if direction=='below' else 'ถึง'} ${target:,.2f}"
-        return "⚠️ ระบบฐานข้อมูลไม่พร้อม"
+            try:
+                supabase.table("alerts").insert({
+                    "user_id": user_id, 
+                    "target_price": target, 
+                    "direction": direction
+                }).execute()
+                return f"✅ บันทึกสำเร็จ: จะเตือนเมื่อราคา {'ต่ำกว่า' if direction=='below' else 'ถึง'} ${target:,.2f}"
+            except Exception as e:
+                logger.error(f"Supabase error: {e}")
+                return "❌ บันทึกข้อมูลไม่สำเร็จ"
+        return "⚠️ ระบบแจ้งเตือนยังไม่พร้อมใช้งาน"
 
+    # คำสั่งเช็กราคาทอง
     if any(k in raw_text for k in ["ทอง", "ราคา", "gold"]):
         data = get_gold_price_thb()
-        if not data: return "❌ ระบบดึงข้อมูลขัดข้อง"
+        if not data: return "❌ ระบบดึงข้อมูลขัดข้อง กรุณาลองใหม่"
+        
         now = datetime.now(pytz.timezone("Asia/Bangkok")).strftime("%H:%M")
-        return (f"🥇 ราคาทองคำ XAUUSD\nSpot: ${data['spot']:,.2f}\nTHB: {data['rate']:.2f}\nทองแท่ง: ฿{data['baht']:,.0f}\n⏰ {now}")
+        return (f"🥇 ราคาทองคำ XAUUSD\n"
+                f"💵 Spot: ${data['spot']:,.2f}\n"
+                f"💱 ค่าเงิน: {data['rate']:.2f} THB\n"
+                f"🔸 ทองแท่ง: ฿{data['baht']:,.0f}\n"
+                f"⏰ {now}")
 
-    return "พิมพ์ 'ทอง' หรือ 'เตือน 2600'"
+    return "พิมพ์ 'ทอง' หรือ 'เตือน 2650' เพื่อเริ่มใช้งาน"
 
+# --- [ 5. Webhook Handlers ] ---
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
@@ -177,45 +227,63 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
-    reply = process_message(event.message.text, event.source.user_id)
+    reply_text = process_message(event.message.text, event.source.user_id)
     with ApiClient(configuration) as api_client:
-        MessagingApi(api_client).reply_message(ReplyMessageRequest(
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message(ReplyMessageRequest(
             reply_token=event.reply_token,
-            messages=[TextMessage(text=reply)]
+            messages=[TextMessage(text=reply_text)]
         ))
 
-# --- [ส่วนที่ 3: Scheduler & Runner] ---
+# --- [ 6. Background Jobs ] ---
 def check_alerts():
     if not supabase: return
     data = get_gold_price_thb()
     if not data: return
+    
     current_spot = data['spot']
     try:
+        # ดึง Alert ทั้งหมดมาเช็ก
         res = supabase.table("alerts").select("*").execute()
         for alert in res.data:
             triggered = False
-            if alert['direction'] == 'above' and current_spot >= alert['target_price']: triggered = True
-            elif alert['direction'] == 'below' and current_spot <= alert['target_price']: triggered = True
+            if alert['direction'] == 'above' and current_spot >= alert['target_price']:
+                triggered = True
+            elif alert['direction'] == 'below' and current_spot <= alert['target_price']:
+                triggered = True
             
             if triggered:
                 msg = f"🔔 แจ้งเตือน! ราคาทองถึงเป้าหมาย: ${current_spot:,.2f}"
                 with ApiClient(configuration) as api_client:
-                    MessagingApi(api_client).push_message(PushMessageRequest(to=alert['user_id'], messages=[TextMessage(text=msg)]))
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.push_message(PushMessageRequest(
+                        to=alert['user_id'], 
+                        messages=[TextMessage(text=msg)]
+                    ))
+                # ลบ Alert ที่ทำงานแล้วออก
                 supabase.table("alerts").delete().eq("id", alert['id']).execute()
     except Exception as e:
         logger.error(f"Alert Job Error: {e}")
 
+# --- [ 7. Runtime Runner ] ---
 if __name__ == "__main__":
     scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
     scheduler.add_job(check_alerts, 'interval', minutes=5)
     scheduler.add_job(http.cleanup, 'interval', minutes=10)
     
+    # รัน Scheduler เฉพาะที่ได้รับอนุญาต (ป้องกัน Render รันซ้อน)
+    is_render = os.environ.get("RENDER") == "true"
     run_sched = os.environ.get("RUN_SCHEDULER") == "true"
-    if os.environ.get("RENDER") != "true" or run_sched:
+    
+    if not is_render or run_sched:
         scheduler.start()
+        logger.info("Scheduler started.")
+        
+        # Self-Ping เพื่อป้องกัน Render หลับ (ถ้ามี URL)
         self_url = os.environ.get("SELF_URL")
         if self_url:
             scheduler.add_job(lambda: requests.get(self_url), 'interval', minutes=14)
 
+    # รัน Web Server
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
