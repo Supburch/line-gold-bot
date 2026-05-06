@@ -162,12 +162,16 @@ if SUPABASE_URL and SUPABASE_KEY:
         logger.error(f"Supabase init failed: {e}")
 
 # --- [ 4. Business Logic ] ---
-def get_gold_price_thb():
-    # Spot Gold (XAU/USD) และ USD/THB Rate
-    gold = http.fetch_json("https://api.frankfurter.app/latest?from=XAU&to=USD", ttl=60)
-    usd_thb = http.fetch_json("https://api.frankfurter.app/latest?from=USD&to=THB", ttl=300)
-
-    if not gold or not usd_thb:
+def get_gold_price():
+    try:
+        res = requests.get(
+            "https://api.frankfurter.app/latest?from=XAU&to=USD",
+            timeout=10
+        )
+        res.raise_for_status()
+        return float(res.json()["rates"]["USD"])
+    except Exception as e:
+        print(f"Gold price error: {e}")
         return None
 
     spot = gold["rates"]["USD"]
