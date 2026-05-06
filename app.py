@@ -9,14 +9,15 @@ from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi, 
+    Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, PushMessageRequest, TextMessage
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from apscheduler.schedulers.background import BackgroundScheduler
 from supabase import create_client
+from concurrent.futures import ThreadPoolExecutor
 
-# --- [ 1. Logging Configuration ] ---
+# ---------- 1. Logging Configuration ----------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -24,113 +25,131 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- [ 2. Advanced HttpClient with Leak Protection ] ---
+# ---------- 2. Flask Setup ----------
+app = Flask(__name__)
+
+# ---------- 3. Environment Config Validation ----------
+LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# ตรวจสอบการกำหนดค่าสิ่งแวดล้อม (Environment Variables Validation)
+if not LINE_TOKEN or not LINE_SECRET:
+    logger.critical("❌ Missing critical LINE API credentials! Webhook handler may fail.")
+
+configuration = Configuration(access_token=LINE_TOKEN or "")
+handler = WebhookHandler(LINE_SECRET or "")
+
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("⚡ Supabase client initialized successfully.")
+    except Exception as e:
+        logger.error(f"❌ Supabase initialization failed: {e}")
+else:
+    logger.warning("⚠️ Supabase credentials missing. Alert features are disabled.")
+
+# ---------- 4. Thread-Safe HttpClient (Anti-Dogpiling & Cache Fallback) ----------
 class HttpClient:
     def __init__(self):
         self.session = requests.Session()
         retry_strategy = Retry(
             total=3,
-            backoff_factor=1,
+            backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET"],
             raise_on_status=False
         )
         adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=50)
-        self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
         self.cache = OrderedDict()
-        self.inflight = {} 
+        self.inflight = {}
         self.lock = Lock()
-        self.throttle_lock = Lock()
         self.stats_lock = Lock()
         
         self.max_cache_size = 100
-        self.default_timeout = (3.05, 7) # (connect, read)
+        self.default_timeout = (3.0, 7.0)  # (Connect, Read)
         self.stats = {"hit": 0, "miss": 0, "error": 0}
-        self._last_calls = {}
 
-    def throttle(self, url, min_interval=1.0):
-        host = urlparse(url).netloc or "default"
-        with self.throttle_lock:
-            now = time.monotonic()
-            last_call = self._last_calls.get(host, now - min_interval)
-            target_time = max(now, last_call + min_interval)
-            sleep_time = target_time - now
-            self._last_calls[host] = target_time
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-
-    def fetch_json(self, url, ttl=60, cache_key=None):
-        key = cache_key or url
+    def fetch(self, url, ttl=60):
         start_wait = time.monotonic()
-        is_owner = False # เก็บสถานะผู้ถือสิทธิ์ดึงข้อมูลสำหรับใช้ใน finally
+        is_owner = False
 
         try:
             while True:
                 now = time.monotonic()
                 is_owner = False
 
+                # Hard timeout เพื่อหลีกเลี่ยงการติด Loop ตลอดกาล
                 if now - start_wait > 15:
-                    logger.error(f"Hard timeout for key: {key}")
+                    logger.error(f"Hard timeout for URL: {url}")
                     return None
 
                 with self.lock:
-                    if key in self.cache:
-                        data, expire = self.cache[key]
+                    # 1. เช็ก LRU Cache (หากข้อมูลยังไม่หมดอายุ ดึงไปใช้งานทันที)
+                    if url in self.cache:
+                        data, expire = self.cache[url]
                         if now < expire:
-                            self.cache.move_to_end(key)
-                            with self.stats_lock: self.stats["hit"] += 1
+                            self.cache.move_to_end(url)
+                            with self.stats_lock:
+                                self.stats["hit"] += 1
                             return data
 
-                    if key in self.inflight:
-                        event = self.inflight[key]
+                    # 2. ควบคุมการทำ In-flight Request (ป้องกันการยิง API ซ้ำซ้อนพร้อมกัน)
+                    if url in self.inflight:
+                        event = self.inflight[url]
                     else:
                         event = Event()
-                        self.inflight[key] = event
+                        self.inflight[url] = event
                         event.clear()
                         is_owner = True
 
                 if not is_owner:
+                    # Thread อื่นรอให้ Thread เจ้าของประมวลผลดึงค่าเสร็จ
                     waited = event.wait(timeout=self.default_timeout[1] + 2)
                     if not waited:
-                        logger.warning(f"In-flight timeout for key: {key}")
-                    continue # วนกลับไปตรวจสอบ Cache ใหม่หลังจากโดนปลุก
+                        logger.warning(f"In-flight timeout waiting for: {url}")
+                    continue  # วนกลับไปอ่านค่าจาก Cache ที่ Thread หลักเขียนบันทึกไว้
 
                 break
 
-            with self.stats_lock: self.stats["miss"] += 1
-            self.throttle(url, 1.0)
-            
+            with self.stats_lock:
+                self.stats["miss"] += 1
+
+            # ดึงข้อมูลจาก API จริง
             res = self.session.get(url, timeout=self.default_timeout)
             res.raise_for_status()
             data = res.json()
-            
+
             with self.lock:
-                self.cache[key] = (data, time.monotonic() + ttl)
-                self.cache.move_to_end(key)
+                self.cache[url] = (data, time.monotonic() + ttl)
+                self.cache.move_to_end(url)
                 if len(self.cache) > self.max_cache_size:
                     self.cache.popitem(last=False)
             return data
 
         except Exception as e:
             if is_owner:
-                with self.stats_lock: self.stats["error"] += 1
-                logger.error(f"Fetch failed {url}: {e}")
-            
+                with self.stats_lock:
+                    self.stats["error"] += 1
+                logger.error(f"HTTP fetch failed on {url}: {e}")
+
+            # Stale Fallback: ดึงข้อมูล Cache ที่หมดอายุไปใช้ชั่วคราวได้ไม่เกิน 5 นาทีหาก API หลักล่ม
             with self.lock:
-                if key in self.cache:
-                    data, expire = self.cache[key]
+                if url in self.cache:
+                    data, expire = self.cache[url]
                     if time.monotonic() - expire < 300:
-                        self.cache.move_to_end(key)
+                        self.cache.move_to_end(url)
                         return data
             return None
 
         finally:
-            # ✅ แก้ไขข้อ 4: ป้องกัน Inflight leak แบบปลอดภัย 100% (เฉพาะ Thread เจ้าของเท่านั้นที่มีสิทธิ์ Set และ Pop)
             if is_owner:
                 with self.lock:
-                    event = self.inflight.pop(key, None)
+                    event = self.inflight.pop(url, None)
                     if event:
                         event.set()
 
@@ -138,31 +157,66 @@ class HttpClient:
         now = time.monotonic()
         with self.lock:
             expired = [k for k, (_, exp) in self.cache.items() if exp < now]
-            for k in expired: del self.cache[k]
-        logger.info(f"Cleanup done. Stats: {self.stats}")
+            for k in expired:
+                del self.cache[k]
+        logger.info(f"LRU Cache cleanup completed. Stats: {self.stats}")
 
 http = HttpClient()
 
-# --- [ 3. Config & External Services ] ---
-# ✅ แก้ไขข้อ 1: ป้องกัน crash จาก Flask(name) เปลี่ยนเป็น __name__
-app = Flask(__name__)
+# ---------- 5. Thread-Pool Executor & Safe Messaging ----------
+# ใช้ ThreadPool สำหรับประมวลผล Webhook ป้องกันอาการ Webhook Timeout (LINE จำกัด 1 วินาที)
+executor = ThreadPoolExecutor(max_workers=10)
 
-LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-
-configuration = Configuration(access_token=LINE_TOKEN)
-handler = WebhookHandler(LINE_SECRET)
-supabase = None
-
-if SUPABASE_URL and SUPABASE_KEY:
+def reply_safe(token, text):
+    if not token:
+        return
+    # ควบคุมความปลอดภัยของข้อความตอบกลับ ป้องกันข้อความว่างเปล่า และจำกัดความยาวสูงสุด
+    safe_text = (text[:2000] if text else "⚠️ ระบบไม่สามารถประมวลผลข้อความได้").strip()
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        with ApiClient(configuration) as api:
+            MessagingApi(api).reply_message(
+                ReplyMessageRequest(
+                    reply_token=token,
+                    messages=[TextMessage(text=safe_text)]
+                )
+            )
     except Exception as e:
-        logger.error(f"Supabase init failed: {e}")
+        logger.error(f"Reply failed: {e}")
 
-# --- [ 4. Alert In-Memory Lock & Deduplication ] ---
+def push_safe(user_id, text):
+    if not user_id:
+        return
+    safe_text = (text[:2000] if text else "⚠️ แจ้งเตือนข้อความขัดข้อง").strip()
+    try:
+        with ApiClient(configuration) as api:
+            MessagingApi(api).push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=[TextMessage(text=safe_text)]
+                ),
+                timeout=5  # กำหนด Timeout สูงสุดป้องกัน Thread ค้างชั่วคราว
+            )
+    except Exception as e:
+        logger.error(f"Push failed: {e}")
+
+# ---------- 6. Business Logic ----------
+def get_gold():
+    gold = http.fetch("https://api.frankfurter.app/latest?from=XAU&to=USD", ttl=60)
+    fx = http.fetch("https://api.frankfurter.app/latest?from=USD&to=THB", ttl=300)
+
+    if not gold or not fx:
+        return None
+
+    try:
+        spot = float(gold["rates"]["USD"])
+        rate = float(fx["rates"]["THB"])
+        baht = (spot * rate / 31.1035) * 15.244 * 0.965
+        return spot, rate, baht
+    except Exception as e:
+        logger.error(f"Error parsing gold price structures: {e}")
+        return None
+
+# ---------- 7. Database & Concurrency Safeguard ----------
 PROCESSING = set()
 PROCESS_LOCK = Lock()
 
@@ -190,7 +244,7 @@ def alert_exists(user_id: str, target: float, direction: str) -> bool:
             .execute()
         return bool(res.data)
     except Exception as e:
-        logger.error(f"alert_exists error: {e}")
+        logger.error(f"Error checking duplicate alerts: {e}")
         return False
 
 def alert_add(user_id: str, target: float, direction: str) -> bool:
@@ -198,7 +252,7 @@ def alert_add(user_id: str, target: float, direction: str) -> bool:
         return False
     try:
         if alert_exists(user_id, target, direction):
-            return False 
+            return False  # มีข้อมูลที่ซ้ำกันอยู่แล้ว
         supabase.table("alerts").insert({
             "user_id": user_id,
             "target_price": target,
@@ -206,166 +260,186 @@ def alert_add(user_id: str, target: float, direction: str) -> bool:
         }).execute()
         return True
     except Exception as e:
-        logger.error(f"alert_add error: {e}")
+        logger.error(f"Failed to insert alert record: {e}")
         return False
 
-# ✅ แก้ไขข้อ 3: ป้องกัน Thread block / Scheduler lag จากการส่ง API ขัดข้องด้วยการตั้ง Timeout 5 วินาที
-def push_safe(user_id, msg):
-    try:
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).push_message(
-                PushMessageRequest(
-                    to=user_id,
-                    messages=[TextMessage(text=msg)]
-                ),
-                timeout=5
-            )
-    except Exception as e:
-        logger.error(f"push error: {e}")
-
-# --- [ 5. Business Logic ] ---
-def get_gold_price_thb():
-    gold = http.fetch_json("https://api.frankfurter.app/latest?from=XAU&to=USD", ttl=60)
-    usd_thb = http.fetch_json("https://api.frankfurter.app/latest?from=USD&to=THB", ttl=300)
-
-    if not gold or not usd_thb:
-        return None
-
-    spot = gold["rates"]["USD"]
-    rate = usd_thb["rates"]["THB"]
-    thb_baht = (spot * rate / 31.1035) * 15.244 * 0.965
-    return {"spot": spot, "rate": rate, "baht": thb_baht}
+# ---------- 8. Parser & Message Handler Logic ----------
+RE_ALERT = re.compile(r"(เตือน|alert|สูงกว่า|ต่ำกว่า)\s*(\d+(\.\d+)?)")
 
 def process_message(text, user_id):
+    if not text or not text.strip():
+        return "❌ ข้อความว่างเปล่า"
+
     raw_text = text.lower().strip()
-    
-    alert_pattern = r'^(?:เตือน|alert|สูงกว่า|ต่ำกว่า)\s*(\d+(?:\.\d+)?)'
-    alert_match = re.search(alert_pattern, raw_text)
-    
-    if alert_match:
-        target = float(alert_match.group(1))
+
+    # 1. การจัดการคำสั่งแจ้งเตือนราคา (Alert Handler)
+    m = RE_ALERT.search(raw_text)
+    if m:
+        try:
+            value = float(m.group(2))
+            if value <= 0 or value > 100000:
+                return "❌ ระบุราคาเป้าหมายไม่ถูกต้อง (ค่าต้องอยู่ระหว่าง 1 ถึง 100,000)"
+        except (ValueError, TypeError):
+            return "❌ รูปแบบตัวเลขไม่ถูกต้อง"
+
         direction = "below" if any(x in raw_text for x in ["ต่ำ", "below", "ลง"]) else "above"
-        
-        if supabase:
-            if alert_exists(user_id, target, direction):
-                return f"📢 คุณเคยตั้งเตือนราคานี้ไว้แล้ว: ${target:,.2f}"
-                
-            if alert_add(user_id, target, direction):
-                return f"✅ บันทึกสำเร็จ: จะเตือนเมื่อราคา {'ต่ำกว่า' if direction=='below' else 'ถึง'} ${target:,.2f}"
-            return "❌ บันทึกข้อมูลแจ้งเตือนไม่สำเร็จ"
-        return "⚠️ ระบบแจ้งเตือนยังไม่พร้อมใช้งาน"
 
-    if any(k in raw_text for k in ["ทอง", "ราคา", "gold"]):
-        data = get_gold_price_thb()
-        if not data: 
-            return "❌ ระบบดึงข้อมูลขัดข้อง กรุณาลองใหม่"
-        
+        if not supabase:
+            return "⚠️ ระบบแจ้งเตือนปิดใช้งานชั่วคราว (Database Server Offline)"
+
+        # ตรวจสอบการตั้งข้อมูลซ้ำก่อนดึงข้อมูลเข้าสู่ฐานข้อมูล
+        if alert_exists(user_id, value, direction):
+            return f"📢 คุณได้เคยตั้งแจ้งเตือนราคานี้ไว้แล้ว: ${value:,.2f}"
+
+        if alert_add(user_id, value, direction):
+            dir_label = "ต่ำกว่าหรือเท่ากับ" if direction == "below" else "สูงกว่าหรือเท่ากับ"
+            return f"✅ บันทึกสำเร็จ: ระบบจะแจ้งเตือนเมื่อราคา {dir_label} ${value:,.2f}"
+        return "❌ ตั้งเตือนไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"
+
+    # 2. การดึงราคาทองคำปัจจุบัน (Price Inquiry Handler)
+    if any(k in raw_text for k in ["ทอง", "gold", "ราคา"]):
+        data = get_gold()
+        if not data:
+            return "❌ ไม่สามารถตรวจสอบราคาทองคำได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง"
+
+        spot, rate, baht = data
         now = datetime.now(pytz.timezone("Asia/Bangkok")).strftime("%H:%M")
-        return (f"🥇 ราคาทองคำ XAUUSD\n"
-                f"💵 Spot: ${data['spot']:,.2f}\n"
-                f"💱 ค่าเงิน: {data['rate']:.2f} THB\n"
-                f"🔸 ทองแท่ง: ฿{data['baht']:,.0f}\n"
-                f"⏰ {now}")
+        return (
+            f"🥇 ราคาทองคำ XAUUSD\n"
+            f"💵 Spot: ${spot:,.2f}\n"
+            f"💱 ค่าเงิน: {rate:.2f} THB\n"
+            f"🔸 ทองแท่งไทย: ฿{baht:,.0f}\n"
+            f"⏰ อัปเดตล่าสุด: {now}"
+        )
 
-    return "พิมพ์ 'ทอง' หรือ 'เตือน 2650' เพื่อเริ่มใช้งาน"
+    return "💡 แนะนำการพิมพ์คำสั่ง:\n• พิมพ์ 'ทอง' เพื่อดูราคาปัจจุบัน\n• พิมพ์ 'เตือน 2650' เพื่อตั้งแจ้งเตือนราคา"
 
-# --- [ 6. Webhook Handlers ] ---
+# ---------- 9. Routing Controller (Flask Endpoints) ----------
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-    return "OK"
 
+    return "OK", 200
+
+@app.route("/ping")
+def ping():
+    db_status = "Connected" if supabase else "Disconnected"
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "database": db_status
+    }, 200
+
+# ---------- 10. Webhook Event Router ----------
 @handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
-    reply_text = process_message(event.message.text, event.source.user_id)
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message(ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[TextMessage(text=reply_text)]
-        ))
+def handle_text_message(event):
+    # ป้องกันกรณีที่ Source Object ไม่มีแอตทริบิวต์ user_id
+    user_id = getattr(event.source, "user_id", None)
+    if not user_id:
+        logger.warning("Event source lacks a valid 'user_id'. Message skipped.")
+        return
 
-# --- [ 7. Background Jobs ] ---
-# ✅ แก้ไขข้อ 2: แก้ปัญหาส่งซ้ำซ้อนโดยใช้ In-memory Locking ควบคู่กับระบบควบคุมการคลาย Lock หลังทำการลบข้อมูลแล้ว
+    # ส่งงานไปรันใน Thread Pool เพื่อความเร็วในการตอบสนอง และส่ง HTTP 200 คืนให้ LINE ทันที
+    executor.submit(async_process_event, event.reply_token, event.message.text, user_id)
+
+def async_process_event(reply_token, message_text, user_id):
+    try:
+        reply_response = process_message(message_text, user_id)
+        reply_safe(reply_token, reply_response)
+    except Exception as e:
+        logger.error(f"Internal Async Processing Error: {e}")
+        reply_safe(reply_token, "❌ ขออภัย ระบบเกิดข้อผิดพลาดในการรันคำสั่ง")
+
+# ---------- 11. Scheduler Alert Engine (Batch-deletion & Race condition lock) ----------
 def check_alerts():
-    if not supabase: 
+    if not supabase:
         return
-    data = get_gold_price_thb()
-    if not data: 
+
+    data = get_gold()
+    if not data:
         return
-    
-    price = data['spot']
+
+    price = data[0]
     try:
         alerts = supabase.table("alerts").select("*").execute().data or []
     except Exception as e:
-        logger.error(f"fetch error: {e}")
+        logger.error(f"Failed to query alerts from Supabase: {e}")
         return
 
     delete_ids = []
 
     for a in alerts:
-        alert_id = a["id"]
+        alert_id = a.get("id")
+        if alert_id is None:
+            continue
 
-        # ดึงสิทธิ์ Lock ในหน่วยความจำเพื่อป้องกัน Job อื่นทำงานซ้อนทับกัน
+        # การจอง Lock หน่วยความจำเพื่อระงับปัญหา Race Condition แจ้งเตือนเบิ้ลซ้ำ
         if not acquire(alert_id):
             continue
 
         released_early = False
         try:
-            direction = a["direction"]
-            target = float(a["target_price"])
+            direction = a.get("direction")
+            target_price = a.get("target_price")
+            user_id = a.get("user_id")
 
-            if (
-                (direction == "above" and price >= target) or
-                (direction == "below" and price <= target)
-            ):
-                push_safe(
-                    a["user_id"], 
-                    f"🔔 ราคาทองถึง ${price:,.2f}"
-                )
+            if not direction or target_price is None or not user_id:
+                # บันทึกเป็น ID เสียหายเพื่อเตรียมทำความสะอาดฐานข้อมูลพร้อมกัน
+                delete_ids.append(alert_id)
+                continue
+
+            target = float(target_price)
+
+            if (direction == "above" and price >= target) or \
+               (direction == "below" and price <= target):
+                
+                # ส่งข้อความผลักแจ้งเตือนผู้ใช้งานเมื่อถึงเงื่อนไข
+                push_safe(user_id, f"🔔 แจ้งเตือนราคาทองคำถึงเป้าหมายแล้ว!\n💵 Spot ราคาปัจจุบัน: ${price:,.2f}")
                 delete_ids.append(alert_id)
             else:
-                # ตัวที่ไม่ผ่านเงื่อนไขให้ปล่อย Lock ทันทีเพื่อให้คิวถัดไปตรวจสอบต่อได้
+                # ปล่อย Lock คีย์ทันทีเมื่อยังไม่ทำงาน เพื่อประหยัดพื้นที่หน่วยความจำ
                 release(alert_id)
                 released_early = True
 
         except Exception as e:
-            logger.error(f"alert loop error: {e}")
+            logger.error(f"Error executing checking cycle for Alert ID {alert_id}: {e}")
             if not released_early:
                 release(alert_id)
 
-    # ✅ แก้ไขข้อ 5: ใช้ Batch delete ลบข้อมูลทั้งหมดทีเดียว ประหยัดรอบการยิงฐานข้อมูลและลดภาระ Supabase
+    # ดำเนินการลบแบบมวลรวม (Batch delete) เพื่อรักษาประสิทธิภาพและประหยัดค่าใช้จ่ายฐานข้อมูล
     if delete_ids:
         try:
             supabase.table("alerts").delete().in_("id", delete_ids).execute()
+            logger.info(f"Successfully processed and deleted alert IDs: {delete_ids}")
         except Exception as e:
-            logger.error(f"batch delete error: {e}")
+            logger.error(f"Failed to batch delete triggered alerts: {e}")
         finally:
-            # คืนสิทธิ์การทำธุรกรรม (Release lock) ของแถวข้อมูลที่ลบออกแล้วอย่างปลอดภัย
             for alert_id in delete_ids:
                 release(alert_id)
 
-# --- [ 8. Runtime Runner ] ---
+# ---------- 12. App Initialization & Lifespans ----------
 if __name__ == "__main__":
     scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
-    scheduler.add_job(check_alerts, 'interval', minutes=5, jitter=30)
-    scheduler.add_job(http.cleanup, 'interval', minutes=10)
+    scheduler.add_job(check_alerts, "interval", minutes=5, jitter=30)
+    scheduler.add_job(http.cleanup, "interval", minutes=10)
     
-    is_render = os.environ.get("RENDER") == "true"
-    run_sched = os.environ.get("RUN_SCHEDULER") == "true"
-    
+    is_render = os.getenv("RENDER") == "true"
+    run_sched = os.getenv("RUN_SCHEDULER") == "true"
+
     if not is_render or run_sched:
         scheduler.start()
-        logger.info("Scheduler started successfully.")
+        logger.info("Scheduler service runs globally.")
         
-        self_url = os.environ.get("SELF_URL")
+        # ป้องกัน Web Service ของ Render หลับชั่วขณะ (Self-Ping Engine)
+        self_url = os.getenv("SELF_URL")
         if self_url:
-            scheduler.add_job(lambda: requests.get(self_url), 'interval', minutes=14)
+            scheduler.add_job(lambda: requests.get(self_url), "interval", minutes=14)
 
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", 5000))
+    app.run("0.0.0.0", port)
