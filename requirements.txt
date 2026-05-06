@@ -5,6 +5,7 @@ pytz==2024.1
 gunicorn==22.0.0
 apscheduler==3.10.4
 supabase==1.2.0
+requests
 
 # --- Stock Updater ---
 gspread
